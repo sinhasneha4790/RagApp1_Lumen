@@ -271,20 +271,33 @@ const API=(window.LUMEN_API||'').replace(/\/$/,'');   // same origin by default;
 const docs=[];let chunks=[];let idf=new Map();let history=[];let busy=false;let health=null;
 async function api(path,body){
   const r=await fetch(API+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  if(!r.ok){let m='Server error '+r.status;try{m=(await r.json()).error||m}catch(e){}throw new Error(m)}
+  if(!r.ok){let m='Server error '+r.status;try{m=(await r.json()).error||m}catch(e){}throw Object.assign(new Error(m),{status:r.status,retryAfter:+r.headers.get('Retry-After')||0})}
   return r;
 }
 // At most 3 embed requests in flight across the whole page; question embeddings jump the queue.
 const EMBED_PARALLEL=3;let embedActive=0;const embedQueue=[];
 function embedSlot(priority){return new Promise(r=>{if(embedActive<EMBED_PARALLEL){embedActive++;r()}else priority?embedQueue.unshift(r):embedQueue.push(r)})}
 function embedRelease(){const next=embedQueue.shift();if(next)next();else embedActive--}
+// On a 429, document batches pause page-wide until Retry-After, then retry (up to 10 times per batch).
+// Question embeddings don't wait: retrieval falls back to keywords instead.
+let embedPauseUntil=0;const EMBED_RETRIES=10;
+async function embedBatch(texts,kind){
+  for(let attempt=0;;attempt++){
+    const wait=embedPauseUntil-Date.now();if(wait>0&&kind!=='query')await new Promise(r=>setTimeout(r,wait));
+    try{return(await(await api('/api/embed',{texts,kind})).json()).vectors}
+    catch(e){
+      if(e.status!==429||kind==='query'||attempt>=EMBED_RETRIES)throw e;
+      embedPauseUntil=Math.max(embedPauseUntil,Date.now()+Math.min(60,Math.max(1,e.retryAfter||5))*1000);
+    }
+  }
+}
 async function embedTexts(texts,kind,onProgress,cancelled){
   const out=new Array(texts.length);let done=0,failed=false;const jobs=[];
   for(let i=0;i<texts.length;i+=50)jobs.push((async()=>{
     await embedSlot(kind==='query');
     try{
       if(failed||(cancelled&&cancelled()))throw new Error('Cancelled');
-      let vs;try{vs=(await(await api('/api/embed',{texts:texts.slice(i,i+50),kind})).json()).vectors}catch(e){failed=true;throw e}
+      let vs;try{vs=await embedBatch(texts.slice(i,i+50),kind)}catch(e){failed=true;throw e}
       vs.forEach((v,j)=>out[i+j]=Float32Array.from(v)); // Float32Array halves memory vs plain arrays
       done+=vs.length;onProgress&&onProgress(done,texts.length);
     }finally{embedRelease()}

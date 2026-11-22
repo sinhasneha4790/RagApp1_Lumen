@@ -190,12 +190,28 @@ test('rate limiter allows N per minute per IP', () => {
   resetRateLimits();
   const req = { headers: { 'x-forwarded-for': '1.2.3.4, 10.0.0.1' }, socket: {} };
   const other = { headers: { 'x-forwarded-for': '5.6.7.8' }, socket: {} };
-  for (let i = 0; i < 60; i++) assert.equal(rateLimited(req, 'chat', 60, 1000), false);
-  assert.equal(rateLimited(req, 'chat', 60, 1000), true);
-  assert.equal(rateLimited(other, 'chat', 60, 1000), false);
-  assert.equal(rateLimited(req, 'chat', 60, 61_001), false);
+  for (let i = 0; i < 60; i++) assert.equal(rateLimited(req, 'chat', 60, 1000), 0);
+  assert.equal(rateLimited(req, 'chat', 60, 1000), 60);
+  assert.equal(rateLimited(other, 'chat', 60, 1000), 0);
+  assert.equal(rateLimited(req, 'chat', 60, 61_001), 0);
 });
 test('static files are served from public/ only', async () => {
   const r = await fetch(base + '/'); assert.equal(r.status, 200); assert.match(await r.text(), /<title>Lumen/);
   assert.equal((await fetch(base + '/%2e%2e/package.json')).status, 404);
+});
+test('Lumen 429s carry Retry-After', async () => {
+  for (let i = 0; i < 120; i++) await post('/api/embed', {});
+  const r = await post('/api/embed', {});
+  assert.equal(r.status, 429);
+  const s = Number(r.headers.get('retry-after'));
+  assert.ok(s >= 1 && s <= 60, `Retry-After ${s}`);
+});
+test('upstream 429 Retry-After is passed through', async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => String(url).startsWith(base) ? realFetch(url, opts)
+    : new Response(JSON.stringify({ error: { code: 429, message: 'Quota', details: [{ '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '17s' }] } }), { status: 429 });
+  try {
+    const r = await post('/api/chat', { question: 'q', context: CTX });
+    assert.equal(r.status, 429); assert.equal(r.headers.get('retry-after'), '17');
+  } finally { globalThis.fetch = realFetch; }
 });

@@ -1,6 +1,6 @@
 // POST /api/chat — streams Server-Sent Events: {step} {th} {t} {usage} {error} {done}
 import { getConfig, LIMITS, MISSING_KEY, THINKING_LEVELS } from '../lib/config.js';
-import { HttpError, preflight, rateLimited, readJson, sendError } from '../lib/http.js';
+import { HttpError, preflight, rateLimited, readJson, sendError, sendTooMany } from '../lib/http.js';
 import { openInteraction, pipeInteraction } from '../lib/gemini.js';
 
 export function validateChat(body, cfg) {
@@ -30,7 +30,8 @@ export function validateChat(body, cfg) {
 export default async function handler(req, res) {
   const cfg = getConfig();
   if (!preflight(req, res, cfg, 'POST')) return;
-  if (rateLimited(req, 'chat', LIMITS.rateChatPerMin)) return sendError(res, 429, 'Too many requests, try again in a minute');
+  const wait = rateLimited(req, 'chat', LIMITS.rateChatPerMin);
+  if (wait) return sendTooMany(res, 'Too many requests, try again in a minute', wait);
   if (!cfg.apiKey) return sendError(res, 500, MISSING_KEY);
 
   const ctrl = new AbortController();
@@ -45,6 +46,7 @@ export default async function handler(req, res) {
     if (e?.name === 'AbortError') return;
     res.upstreamStatus = e.upstreamStatus;
     if (!e.status) console.error('chat failed before stream:', e.name);
+    if (e.status === 429) return sendTooMany(res, e.message, e.retryAfter);
     return sendError(res, e.status || 500, e.status ? e.message : 'Server error');
   }
 
