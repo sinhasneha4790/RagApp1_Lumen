@@ -218,6 +218,7 @@ dialog .list{padding:6px 20px 20px;max-height:70vh;overflow-y:auto}
   <section>
     <div class="sec-h"><h2>Library</h2><span id="libc"></span></div>
     <ul class="files" id="files"></ul>
+    <p class="note err" id="libwarn" role="status" hidden></p>
   </section>
 
   <section class="gpanel">
@@ -259,9 +260,12 @@ dialog .list{padding:6px 20px 20px;max-height:70vh;overflow-y:auto}
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
-<script>
+<script type="module">
+import {chunkText} from './lib/chunker.js';
+import {tokens,tf,buildIndex,rank} from './lib/retrieval.js';
 {
 const $=id=>document.getElementById(id);
+const LOCAL=location.hostname==='localhost'; // show "npm start" hints only in local dev
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const API=(window.LUMEN_API||'').replace(/\/$/,'');   // same origin by default; set window.LUMEN_API if the server lives elsewhere
 const docs=[];let chunks=[];let idf=new Map();let history=[];let busy=false;let health=null;
@@ -270,12 +274,23 @@ async function api(path,body){
   if(!r.ok){let m='Server error '+r.status;try{m=(await r.json()).error||m}catch(e){}throw new Error(m)}
   return r;
 }
-async function embedTexts(texts,kind,onProgress){
-  const out=[];
-  for(let i=0;i<texts.length;i+=50){
-    const r=await api('/api/embed',{texts:texts.slice(i,i+50),kind});
-    out.push(...(await r.json()).vectors);onProgress&&onProgress(out.length,texts.length);
-  }
+// At most 3 embed requests in flight across the whole page; question embeddings jump the queue.
+const EMBED_PARALLEL=3;let embedActive=0;const embedQueue=[];
+function embedSlot(priority){return new Promise(r=>{if(embedActive<EMBED_PARALLEL){embedActive++;r()}else priority?embedQueue.unshift(r):embedQueue.push(r)})}
+function embedRelease(){const next=embedQueue.shift();if(next)next();else embedActive--}
+async function embedTexts(texts,kind,onProgress,cancelled){
+  const out=new Array(texts.length);let done=0,failed=false;const jobs=[];
+  for(let i=0;i<texts.length;i+=50)jobs.push((async()=>{
+    await embedSlot(kind==='query');
+    try{
+      if(failed||(cancelled&&cancelled()))throw new Error('Cancelled');
+      let vs;try{vs=(await(await api('/api/embed',{texts:texts.slice(i,i+50),kind})).json()).vectors}catch(e){failed=true;throw e}
+      vs.forEach((v,j)=>out[i+j]=Float32Array.from(v)); // Float32Array halves memory vs plain arrays
+      done+=vs.length;onProgress&&onProgress(done,texts.length);
+    }finally{embedRelease()}
+  })());
+  const res=await Promise.allSettled(jobs);
+  const bad=res.find(r=>r.status==='rejected'&&r.reason?.message!=='Cancelled')||res.find(r=>r.status==='rejected');if(bad)throw bad.reason;
   return out;
 }
 
@@ -313,50 +328,19 @@ async function readFile(f){
   return[{page:null,text:t}];
 }
 
-/* ---------- Chunking ---------- */
-function chunkText(pages,size,overlap){
-  const out=[];overlap=Math.min(overlap,size-50);
-  for(const p of pages){
-    const text=p.text.replace(/[ \t]+/g,' ').replace(/\n{3,}/g,'\n\n').trim();if(!text)continue;
-    let start=0;
-    while(start<text.length){
-      let end=Math.min(start+size,text.length);
-      if(end<text.length){const win=text.slice(start+Math.floor(size*.6),end);
-        const b=Math.max(win.lastIndexOf('\n\n'),win.lastIndexOf('. '),win.lastIndexOf('? '),win.lastIndexOf('! '));
-        if(b>-1)end=start+Math.floor(size*.6)+b+1}
-      out.push({page:p.page,text:text.slice(start,end).trim()});
-      if(end>=text.length)break;
-      start=Math.max(end-overlap,start+1);
-      const sp=text.indexOf(' ',start);if(sp>-1&&sp-start<30)start=sp+1;
-    }
-  }
-  return out.filter(c=>c.text.length>20);
-}
-
-/* ---------- Embedding (TF-IDF) ---------- */
-const STOP=new Set('a an the and or but if of to in on at by for with from as is are was were be been being it its this that these those i you he she we they them our your their my me do does did not no so than then there here what which who whom when where why how can could should would will shall may might must have has had into about over under up down out also just only very more most such each any all some'.split(' '));
-const stem=w=>w.length>4?w.replace(/(ies)$/,'y').replace(/(ing|edly|ed|es|s)$/,''):w;
-const tokens=s=>(s.toLowerCase().match(/[a-z0-9À-￿]+/g)||[]).filter(w=>!STOP.has(w)&&w.length>1).map(stem);
-function tf(toks){const m=new Map();for(const t of toks)m.set(t,(m.get(t)||0)+1);return m}
-function vec(tfm){const v=new Map();let n=0;for(const[t,c]of tfm){const w=(1+Math.log(c))*(idf.get(t)||0);if(w){v.set(t,w);n+=w*w}}return{v,n:Math.sqrt(n)||1}}
+/* ---------- Chunking and TF-IDF index: see lib/chunker.js and lib/retrieval.js ---------- */
 function rebuildIndex(){
   chunks=docs.filter(d=>d.status==='ready').flatMap(d=>d.chunks);
-  const df=new Map();for(const c of chunks)for(const t of c.tf.keys())df.set(t,(df.get(t)||0)+1);
-  const N=chunks.length;idf=new Map([...df].map(([t,d])=>[t,Math.log((N+1)/(d+.5))]));
-  for(const c of chunks)c.vec=vec(c.tf);
+  idf=buildIndex(chunks);
 }
-const dot=(a,b)=>{let s=0;for(let i=0;i<a.length;i++)s+=a[i]*b[i];return s};
 async function retrieve(q,k,T){
-  const qv=vec(tf(tokens(q)));
-  const kw=c=>{let s=0;for(const[t,w]of qv.v){const x=c.vec.v.get(t);if(x)s+=w*x}return s/(qv.n*c.vec.n)};
   let qe=null;
   if(chunks.some(c=>c.emb)){const t0=performance.now();try{qe=(await embedTexts([q],'query'))[0];if(T)T.emb.ms=performance.now()-t0}catch(e){if(T)T.emb.err=e.message;console.warn('Query embedding failed, using keywords only',e)}}
   else if(T)T.emb.err='No Gemini vectors in the library yet.';
   if(T){T.emb.state=T.emb.err?'err':'done';T.ret.state='run'}
   const r0=performance.now();
   // Hybrid score: 80% Gemini semantic similarity + 20% keyword match (keyword-only when embeddings are unavailable)
-  const out=chunks.map(c=>{const k1=kw(c);const sem=qe&&c.emb?dot(qe,c.emb):null;return{c,score:sem==null?k1:.8*sem+.2*k1,sem}})
-    .filter(r=>r.score>0).sort((a,b)=>b.score-a.score).slice(0,k);
+  const out=rank(chunks,q,idf,qe,k);
   if(T)T.ret.ms=performance.now()-r0;
   return out;
 }
@@ -383,20 +367,25 @@ async function ingest(name,size,getPages,isSample){
   }catch(e){d.status='error';d.error=e.message||'Could not read file';renderFiles()}
 }
 async function process(d){
-  const s=settings();
+  const s=settings();const gen=d.gen=(d.gen||0)+1;
+  const stale=()=>d.gen!==gen||!docs.includes(d); // file removed or re-chunked meanwhile
   const raw=chunkText(d.pages,s.size,s.overlap);
-  if(!raw.length){d.status='error';d.error='No readable text (scanned PDFs need OCR)';renderFiles();return}
+  if(!raw.length){d.status='error';d.error='No readable text (scanned PDFs need OCR)';d.nChunks=0;renderFiles();return}
+  d.nChunks=raw.length;
   d.stage=2;d.status='embedding';d.prog=`0/${raw.length}`;renderFiles();
   const built=raw.map((c,i)=>({doc:d.name,docId:d.id,idx:i+1,page:c.page,text:c.text,tf:tf(tokens(c.text))}));
   d.embedErr=null;
-  try{const vs=await embedTexts(built.map(c=>c.text),'document',(n,t)=>{d.prog=`${n}/${t}`;renderFiles()});vs.forEach((v,i)=>built[i].emb=v)}
-  catch(e){d.embedErr=e.message;console.warn('Embedding failed, falling back to keyword search',e)}
+  try{const vs=await embedTexts(built.map(c=>c.text),'document',(n,t)=>{if(!stale()){d.prog=`${n}/${t}`;renderFiles()}},stale);vs.forEach((v,i)=>built[i].emb=v)}
+  catch(e){if(stale())return;d.embedErr=e.message;console.warn('Embedding failed, falling back to keyword search',e)}
+  if(stale())return;
   d.chunks=built;d.prog=null;
   d.stage=3;d.status='indexing';renderFiles();rebuildIndex();await tick();
+  if(stale())return;
   d.stage=4;d.status='ready';rebuildIndex();renderFiles();
 }
 const tick=()=>new Promise(r=>setTimeout(r,220));
 const MAX_FILE_BYTES=10*1024*1024; // 10 MB per file
+const CHUNK_WARN=20000;            // warn in the library above this many chunks
 function addFiles(list){
   for(const f of list){
     if(f.size>MAX_FILE_BYTES){
@@ -420,6 +409,9 @@ function renderFiles(){
     :'<p class="empty">Your library is empty.</p>';
   const ready=docs.filter(d=>d.status==='ready').length;
   $('libc').textContent=docs.length?`${ready} of ${docs.length} ready`:'';
+  const total=docs.reduce((n,d)=>n+(d.status==='ready'?d.chunks.length:d.status==='error'?0:d.nChunks||0),0);
+  $('libwarn').hidden=total<=CHUNK_WARN;
+  $('libwarn').textContent=`${total.toLocaleString()} chunks in your library. Above ${CHUNK_WARN.toLocaleString()}, the page may slow down or run out of memory. Remove some files or raise the chunk size.`;
   const g=health?(health.ok?`<span class="pill" title="Embeddings: ${esc(health.embedModel)}"><i class="dot"></i>Gemini · <b>${esc(health.chatModel)}</b></span>`:`<span class="pill" title="${esc(health.error||'')}"><i class="dot off"></i>Gemini not connected</span>`):'';
   $('stat').innerHTML=`${g}<span class="pill"><b>${ready}</b> file${ready===1?'':'s'} indexed</span><span class="pill k"><b>${chunks.length}</b> chunks</span><span class="pill k">top <b>${settings().k}</b> per question</span>`;
   if(!history.length)renderWelcome();
@@ -540,7 +532,7 @@ async function ask(q){
   }catch(e){
     for(const s of['emb','ret','thk','ans'])if(T[s].state==='run')T[s].state='err';
     paint();
-    const m=/Failed to fetch|NetworkError/i.test(e.message)?'Can’t reach the Lumen server. Make sure it’s running (npm start) and refresh.':e.message;
+    const m=/Failed to fetch|NetworkError/i.test(e.message)?(LOCAL?'Can’t reach the Lumen server. Make sure it’s running (npm start) and refresh.':'Can’t reach the Lumen server. Try again shortly.'):e.message;
     body.hidden=false;body.innerHTML=(answer?md(answer,hits.length):'')+`<p class="err">${esc(m)}</p>`;
   }
   busy=false;$('send').disabled=false;scrollEnd();
@@ -556,7 +548,7 @@ const dz=$('drop');
 document.addEventListener('drop',e=>{if(e.dataTransfer.files.length)addFiles([...e.dataTransfer.files])});
 document.addEventListener('click',e=>{
   const t=e.target.closest('button');if(!t)return;
-  if(t.dataset.rm){const i=docs.findIndex(d=>d.id==t.dataset.rm);if(i>-1)docs.splice(i,1);rebuildIndex();renderFiles()}
+  if(t.dataset.rm){const i=docs.findIndex(d=>d.id==t.dataset.rm);if(i>-1){docs[i].gen=(docs[i].gen||0)+1;docs.splice(i,1)}rebuildIndex();renderFiles()}
   if(t.dataset.view){const d=docs.find(d=>d.id==t.dataset.view);showDlg(`${d.name} · ${d.chunks.length} chunks`,d.chunks.map(c=>`<div class="ck"><b>Chunk ${c.idx}${c.page?' · page '+c.page:''} · ${c.text.length} characters</b>${esc(c.text)}</div>`).join(''))}
   if(t.dataset.full){const h=srcStore[+t.dataset.full];showDlg(`${h.c.doc} · chunk ${h.c.idx}${h.c.page?' · page '+h.c.page:''}`,`<div class="ck">${esc(h.c.text)}</div>`)}
   if(t.dataset.q)ask(t.dataset.q);
@@ -578,7 +570,7 @@ $('clear').onclick=()=>{history=[];srcStore=[];renderWelcome();$('q').focus()};
 /* ---------- Start ---------- */
 ingest('Sample – returns policy.txt',SAMPLE_TEXT.length,async()=>[{page:null,text:SAMPLE_TEXT}],true);
 renderFiles();renderGemini();
-fetch(API+'/api/health').then(r=>r.json()).then(h=>{health=h;renderFiles();renderGemini()}).catch(()=>{health={ok:false,chatModel:'',error:'Server not reachable. Start it with npm start.'};renderFiles();renderGemini()});
+fetch(API+'/api/health').then(r=>r.json()).then(h=>{health=h;renderFiles();renderGemini()}).catch(()=>{health={ok:false,chatModel:'',error:LOCAL?'Server not reachable. Start it with npm start.':'Server not reachable.'};renderFiles();renderGemini()});
 }
 </script>
 </body>
