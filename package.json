@@ -1,0 +1,16 @@
+{
+  "name": "lumen",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Lumen — chat with your documents (RAG) using Google Gemini, deployed on Vercel",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "node scripts/dev-server.js",
+    "start": "node scripts/dev-server.js",
+    "dev:mock": "node test/mock-gemini.js & GEMINI_BASE_URL=http://localhost:4999 GEMINI_API_KEY=test GOOGLE_API_KEY= node scripts/dev-server.js",
+    "test": "node --test test/"
+  }
+}
