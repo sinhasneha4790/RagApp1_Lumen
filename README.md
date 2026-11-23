@@ -79,7 +79,7 @@ Errors are JSON, `{ "error": "…" }`. Upstream 429 is passed through as 429, an
 
 ## Security
 
-- The key is read only from server environment variables. It is never sent to the browser, put in an error, or logged. Logs hold only the method, path, status, duration and upstream status.
+- The key is read only from server environment variables. It is never sent to the browser, put in an error, or logged. Logs hold the method, path, status, duration and upstream status. When a Gemini call fails, the log also gets Gemini's own error message, capped at 300 characters with anything that looks like an API key removed. Request bodies, documents and answers are never logged.
 - **Restrict your key** to the Gemini API in Google AI Studio, and **set billing alerts** in Google Cloud.
 - Input sizes are validated on every endpoint, and request bodies are capped at 4 MB, under Vercel's 4.5 MB limit. Files are parsed in the browser, so only chunk text is sent.
 - All document and model text is HTML-escaped before it's rendered.
