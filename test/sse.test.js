@@ -100,3 +100,18 @@ test('interaction body matches section 7.3', () => {
   assert.deepEqual(b.input.map(i => i.type), ['user_input', 'model_output', 'user_input']);
   assert.match(b.system_instruction, /\(no matching passages were found\)$/);
 });
+
+test('geminiError logs Gemini\'s message, truncated and with keys redacted', async () => {
+  const { geminiError } = await import('../lib/gemini.js');
+  const logs = []; const orig = console.warn; console.warn = m => logs.push(m);
+  process.env.GEMINI_API_KEY = 'secret-key-12345';
+  try {
+    const body = { error: { code: 503, status: 'UNAVAILABLE', message: 'Model busy for key secret-key-12345 and AIzaSyA1234567890abcdefghijklmn ' + 'x'.repeat(400) } };
+    const e = await geminiError(new Response(JSON.stringify(body), { status: 503 }));
+    assert.equal(e.status, 502); assert.equal(e.message, 'Gemini is unavailable, try again');
+    assert.equal(logs.length, 1);
+    assert.match(logs[0], /^gemini upstream 503: UNAVAILABLE: Model busy for key \[redacted\] and \[redacted\]/);
+    assert.ok(!logs[0].includes('secret-key-12345') && !logs[0].includes('AIza'));
+    assert.ok(logs[0].length <= 'gemini upstream 503: '.length + 300);
+  } finally { console.warn = orig; delete process.env.GEMINI_API_KEY; }
+});
