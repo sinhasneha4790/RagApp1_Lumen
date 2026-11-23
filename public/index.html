@@ -163,6 +163,8 @@ main{display:flex;flex-direction:column;height:100vh;overflow:hidden;background:
 .src .txt{color:var(--mute);margin-top:8px;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
 .src button{border:0;background:none;color:var(--rose);padding:0;font-size:13px;margin-top:6px}
 .err{color:var(--bad)}
+.trace .fail{display:inline-flex;align-items:center;gap:8px;color:var(--bad)}
+.trace .fail::before{content:"";flex:none;width:8px;height:8px;border-radius:50%;background:var(--bad)}
 
 /* composer */
 form.ask{padding:10px max(4vw,16px) 18px}
@@ -496,7 +498,8 @@ function traceHTML(T){
     ['thk','Think',`Thinking level: ${LV[T.level]||T.level}${T.usage&&T.usage.total_thought_tokens!=null?` · ${T.usage.total_thought_tokens} thought tokens`:''}${T.thk.state==='done'&&!T.thought?' · no summary returned':''}`],
     ['ans','Write the answer',`${cm} · Interactions API, streamed${T.usage&&T.usage.total_output_tokens!=null?` · ${T.usage.total_output_tokens} output tokens`:''}`]
   ];
-  const sum=T.done?`Embedded → ${T.ret.n} passage${T.ret.n===1?'':'s'} → thought ${fmtMs(T.thk.ms)} → answered in ${fmtMs(T.total)}${T.usage&&T.usage.total_tokens?` · ${T.usage.total_tokens.toLocaleString()} tokens`:''}`
+  const sum=T.failed?`<span class="fail">Failed at ${esc(rows.find(([k])=>k===T.failedAt)?.[1]||'the last step')}${T.total!=null?` after ${fmtMs(T.total)}`:''}</span>`
+    :T.done?`Embedded → ${T.ret.n} passage${T.ret.n===1?'':'s'} → thought ${fmtMs(T.thk.ms)} → answered in ${fmtMs(T.total)}${T.usage&&T.usage.total_tokens?` · ${T.usage.total_tokens.toLocaleString()} tokens`:''}`
     :`<span class="typing"><i></i><i></i><i></i>${rows.find(([k])=>T[k].state==='run')?.[1]||'Working'}…</span>`;
   return`<summary>${T.done?'<span class="gem sm"></span>':''}${sum}</summary><ol class="steps2">${rows.map(([k,label,d])=>`<li class="st ${T[k].state}"><span class="ic"></span><div><b>${label}</b><small>${esc(d)}</small>${k==='thk'&&T.thought?`<div class="thought">${esc(T.thought)}</div>`:''}</div><span class="ms">${fmtMs(T[k].ms)}</span></li>`).join('')}</ol>`;
 }
@@ -543,7 +546,8 @@ async function ask(q){
     tr.open=false;paint();
     history.push({role:'user',content:q},{role:'assistant',content:answer});
   }catch(e){
-    for(const s of['emb','ret','thk','ans'])if(T[s].state==='run')T[s].state='err';
+    for(const s of['emb','ret','thk','ans'])if(T[s].state==='run'){T[s].state='err';T.failedAt=T.failedAt||s}
+    T.failed=true;T.total=performance.now()-t0;
     paint();
     const m=/Failed to fetch|NetworkError/i.test(e.message)?(LOCAL?'Can’t reach the Lumen server. Make sure it’s running (npm start) and refresh.':'Can’t reach the Lumen server. Try again shortly.'):e.message;
     body.hidden=false;body.innerHTML=(answer?md(answer,hits.length):'')+`<p class="err">${esc(m)}</p>`;
