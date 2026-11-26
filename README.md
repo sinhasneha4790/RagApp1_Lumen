@@ -14,6 +14,12 @@ question → embed → hybrid rank → top-k ─────▶  POST /api/chat 
 render streamed reasoning, answer, [n] ◀─SSE──                                     openai/gpt-oss-120b
 ```
 
+## Docs
+
+- [`TECHNICAL_SPEC.md`](TECHNICAL_SPEC.md): the full technical spec (v1.1)
+- [`docs/Lumen-RAG-Flowchart.pdf`](docs/Lumen-RAG-Flowchart.pdf): how the app works, step by step (add a document, ask a question)
+- [`docs/Lumen-Build-Flowchart.pdf`](docs/Lumen-Build-Flowchart.pdf): how Lumen was built, from the design files to the Groq switch
+
 ## Quick start (local)
 
 Requires **Node.js 22+**. There is nothing to `npm install`.
