@@ -16,9 +16,73 @@ render streamed reasoning, answer, [n] ◀─SSE──                          
 
 ## Docs
 
-- [`TECHNICAL_SPEC.md`](TECHNICAL_SPEC.md): the full technical spec (v1.1)
-- [`docs/Lumen-RAG-Flowchart.pdf`](docs/Lumen-RAG-Flowchart.pdf): how the app works, step by step (add a document, ask a question)
-- [`docs/Lumen-Build-Flowchart.pdf`](docs/Lumen-Build-Flowchart.pdf): how Lumen was built, from the design files to the Groq switch
+| Document | What it covers |
+|---|---|
+| [`TECHNICAL_SPEC.md`](TECHNICAL_SPEC.md) | The full technical spec (v1.1). Section 17 lists every change from the original Gemini-only spec. |
+| [`docs/Lumen-RAG-Flowchart.pdf`](docs/Lumen-RAG-Flowchart.pdf) | **How the app works**, step by step (3 pages, A4) |
+| [`docs/Lumen-Build-Flowchart.pdf`](docs/Lumen-Build-Flowchart.pdf) | **How Lumen was built**, from the design files to the switch to Groq (3 pages, A4) |
+
+## Flowcharts
+
+Both PDFs use the same colour key: each step is coloured by where it happens or who does it, decisions are dashed yellow boxes, problem or fallback paths branch off to the right, and finished steps are green. Click a preview to open the PDF.
+
+### How the app works — [`Lumen-RAG-Flowchart.pdf`](docs/Lumen-RAG-Flowchart.pdf)
+
+<p>
+<a href="docs/Lumen-RAG-Flowchart.pdf"><img src="docs/previews/app-1.png" width="260" alt="Page 1: the big picture"></a>
+<a href="docs/Lumen-RAG-Flowchart.pdf"><img src="docs/previews/app-2.png" width="260" alt="Page 2: Phase A, add a document"></a>
+<a href="docs/Lumen-RAG-Flowchart.pdf"><img src="docs/previews/app-3.png" width="260" alt="Page 3: Phase B, ask a question"></a>
+</p>
+
+| Page | Contents |
+|---|---|
+| 1. The big picture | How the browser, the Vercel Functions, Gemini (embeddings) and Groq (answers) fit together; both phases in short; key numbers; the four-step answer trace; common errors and what they mean; privacy |
+| 2. Phase A · Add a document | 11 steps from picking a file to "Ready" |
+| 3. Phase B · Ask a question | 11 steps from typing a question to a cited answer |
+
+**Phase A · Add a document** (browser → `/api/embed` → Gemini)
+
+1. The user drops or browses for a file.
+2. **Size OK (1 byte – 10 MB)?** If not, the card shows an error and nothing is sent.
+3. The browser reads the text: pdf.js for PDF (keeping page numbers), mammoth for Word, the File API for text formats.
+4. **Any readable text?** If not: "No readable text (scanned PDFs need OCR)" or "This format isn't supported".
+5. The text is split into ~900-character chunks with 150 overlap, breaking at paragraph or sentence ends.
+6. Chunk text is sent to `POST /api/embed` in batches of 50, at most 3 at a time.
+7. The server validates the batch and calls Gemini `gemini-embedding-001` (`RETRIEVAL_DOCUMENT`, 768-d), then normalises each vector.
+8. **Rate limited (429)?** All batches pause until `Retry-After`, then retry (up to 10 times).
+9. **Embedding succeeded?** If not, the file is kept with keyword search only.
+10. Vectors and a TF-IDF keyword index are stored in browser memory.
+11. The file is **Ready**.
+
+**Phase B · Ask a question** (browser → `/api/embed` → Gemini, then browser → `/api/chat` → Groq)
+
+1. The user asks a question, at thinking level Low, Medium or High.
+2. **Any files indexed?** If not: "Upload a file first".
+3. The question is embedded with Gemini (`RETRIEVAL_QUERY`).
+4. **Question embedded?** If not, ranking falls back to keywords only.
+5. Passages are ranked by 80% cosine similarity + 20% keyword match, and the top 5 are kept.
+6. The question, numbered passages, last 8 chat turns and thinking level go to `POST /api/chat`.
+7. The server builds the "answer only from these passages, cite [n]" prompt and calls Groq `openai/gpt-oss-120b`, streamed.
+8. **Groq accepted the request?** If not, the error is shown, the trace reads "Failed at Think", and the reason is logged as `groq upstream …`.
+9. Groq streams reasoning, then the answer; the server forwards them as `{th}`, `{t}`, `{usage}` and `{done}` events.
+10. The page renders the reasoning, the answer with `[n]` citation chips, the source cards and token counts.
+11. **Done:** the trace collapses to "Embedded → N passages → thought X s → answered in Y s · Z tokens".
+
+### How Lumen was built — [`Lumen-Build-Flowchart.pdf`](docs/Lumen-Build-Flowchart.pdf)
+
+<p>
+<a href="docs/Lumen-Build-Flowchart.pdf"><img src="docs/previews/build-1.png" width="260" alt="Page 1: timeline, decisions, commits, lessons"></a>
+<a href="docs/Lumen-Build-Flowchart.pdf"><img src="docs/previews/build-2.png" width="260" alt="Page 2: plan, build, ship"></a>
+<a href="docs/Lumen-Build-Flowchart.pdf"><img src="docs/previews/build-3.png" width="260" alt="Page 3: fix and document"></a>
+</p>
+
+| Page | Contents |
+|---|---|
+| 1. Overview | Timeline of the five stages (22–26 Nov 2026), key numbers, every decision made along the way, the commit history and lessons learned |
+| 2. Plan, build, ship | 12 steps: reviewing the design and spec, agreeing open questions, the six build milestones, testing, then GitHub and Vercel, with each problem hit and how it was fixed |
+| 3. Fix and document | 11 steps: Gemini chat failing in production with 503 "high demand", diagnosing it (logs, another model, `curl` tests, free-tier key), switching answers to Groq, confirming it in production, and updating the docs |
+
+The flowchart PDFs show the design at the time they were made (spec v1.1). Update them when the pipeline changes.
 
 ## Quick start (local)
 
