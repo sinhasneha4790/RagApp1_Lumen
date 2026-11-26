@@ -1,7 +1,7 @@
 // POST /api/chat — streams Server-Sent Events: {step} {th} {t} {usage} {error} {done}
-import { getConfig, LIMITS, MISSING_KEY, THINKING_LEVELS } from '../lib/config.js';
+import { getConfig, LIMITS, MISSING_GROQ_KEY, THINKING_LEVELS } from '../lib/config.js';
 import { HttpError, preflight, rateLimited, readJson, sendError, sendTooMany } from '../lib/http.js';
-import { openInteraction, pipeInteraction } from '../lib/gemini.js';
+import { openChat, pipeChat } from '../lib/groq.js';
 
 export function validateChat(body, cfg) {
   const question = typeof body.question === 'string' ? body.question.trim() : '';
@@ -32,7 +32,7 @@ export default async function handler(req, res) {
   if (!preflight(req, res, cfg, 'POST')) return;
   const wait = rateLimited(req, 'chat', LIMITS.rateChatPerMin);
   if (wait) return sendTooMany(res, 'Too many requests, try again in a minute', wait);
-  if (!cfg.apiKey) return sendError(res, 500, MISSING_KEY);
+  if (!cfg.groqKey) return sendError(res, 500, MISSING_GROQ_KEY);
 
   const ctrl = new AbortController();
   res.on('close', () => { if (!res.writableEnded) ctrl.abort(); });
@@ -40,7 +40,7 @@ export default async function handler(req, res) {
   let upstream;
   try {
     const payload = validateChat(await readJson(req, LIMITS.bodyMaxBytes), cfg);
-    upstream = await openInteraction(payload, { cfg, signal: ctrl.signal });
+    upstream = await openChat(payload, { cfg, signal: ctrl.signal });
     res.upstreamStatus = upstream.status;
   } catch (e) {
     if (e?.name === 'AbortError') return;
@@ -58,7 +58,7 @@ export default async function handler(req, res) {
   res.flushHeaders?.();
   const emit = obj => { if (!res.writableEnded) res.write(`data: ${JSON.stringify(obj)}\n\n`); };
   try {
-    await pipeInteraction(upstream, emit);
+    await pipeChat(upstream, emit);
   } catch (e) {
     if (e?.name !== 'AbortError') { console.error('chat stream failed:', e.name); emit({ error: 'The answer stream was interrupted, try again' }); }
   }

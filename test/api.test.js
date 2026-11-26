@@ -6,6 +6,7 @@ import { rateLimited, resetRateLimits } from '../lib/http.js';
 
 let mock, app, base;
 const KEY = 'test-key-123';
+const GROQ_KEY = 'gsk_test_groq_key';
 
 before(async () => {
   mock = await startMock({ port: 0, delay: 1, quiet: true });
@@ -15,8 +16,9 @@ before(async () => {
 });
 after(async () => { await mock.close(); await new Promise(r => app.close(r)); });
 beforeEach(async () => {
-  Object.assign(process.env, { GEMINI_BASE_URL: `http://localhost:${mock.port}`, GEMINI_API_KEY: KEY, GOOGLE_API_KEY: '' });
-  for (const k of ['GEMINI_API_REVISION', 'GEMINI_MODEL', 'GEMINI_EMBED_MODEL', 'GEMINI_EMBED_DIM', 'GEMINI_THINKING_LEVEL', 'ALLOW_ORIGIN']) delete process.env[k];
+  Object.assign(process.env, { GEMINI_BASE_URL: `http://localhost:${mock.port}`, GEMINI_API_KEY: KEY, GOOGLE_API_KEY: '',
+    GROQ_BASE_URL: `http://localhost:${mock.port}/openai/v1`, GROQ_API_KEY: GROQ_KEY });
+  for (const k of ['GROQ_MODEL', 'GROQ_REASONING_EFFORT', 'GROQ_MAX_TOKENS', 'GEMINI_EMBED_MODEL', 'GEMINI_EMBED_DIM', 'ALLOW_ORIGIN']) delete process.env[k];
   resetRateLimits();
   await fetch(`http://localhost:${mock.port}/__reset`, { method: 'POST' });
 });
@@ -31,16 +33,19 @@ async function readSSE(r) {
 }
 
 /* ---------- health ---------- */
-test('health reports models and never echoes the key', async () => {
+test('health reports both providers and never echoes the keys', async () => {
   const r = await fetch(base + '/api/health'); const text = await r.text(); const j = JSON.parse(text);
   assert.equal(r.status, 200);
-  assert.deepEqual(j, { ok: true, chatModel: 'gemini-3.8-flash', embedModel: 'gemini-embedding-001', dim: 768, apiVersion: 'v1beta', thinking: 'low' });
-  assert.ok(!text.includes(KEY));
+  assert.deepEqual(j, { ok: true, chatProvider: 'Groq', chatModel: 'openai/gpt-oss-120b', embedProvider: 'Gemini', embedModel: 'gemini-embedding-001', dim: 768, thinking: 'low', thinkingLevels: ['low', 'medium', 'high'], chatReady: true, embedReady: true });
+  assert.ok(!text.includes(KEY) && !text.includes(GROQ_KEY));
 });
-test('health without a key', async () => {
+test('health without keys names each missing one', async () => {
   process.env.GEMINI_API_KEY = '';
-  const j = await (await fetch(base + '/api/health')).json();
-  assert.equal(j.ok, false); assert.equal(j.error, 'GEMINI_API_KEY is not set on the server');
+  let j = await (await fetch(base + '/api/health')).json();
+  assert.equal(j.ok, false); assert.equal(j.error, 'GEMINI_API_KEY is not set on the server'); assert.equal(j.chatReady, true);
+  process.env.GROQ_API_KEY = '';
+  j = await (await fetch(base + '/api/health')).json();
+  assert.equal(j.error, 'GROQ_API_KEY is not set on the server; GEMINI_API_KEY is not set on the server');
 });
 test('GOOGLE_API_KEY takes precedence', async () => {
   process.env.GOOGLE_API_KEY = 'google-key';
@@ -126,7 +131,7 @@ test('network failure → 502', async () => {
 
 /* ---------- chat ---------- */
 const CTX = [{ n: 1, doc: 'policy.txt', page: null, text: 'Unused items can be returned within 30 days.' }];
-test('chat streams thought, text, usage and done; sends the right headers and config', async () => {
+test('chat streams reasoning, text, usage and done via Groq; sends the right request', async () => {
   const r = await post('/api/chat', { question: 'How long to return?', context: CTX, history: [{ role: 'user', content: 'hi' }, { role: 'assistant', content: 'hello' }], thinking: 'high' });
   assert.equal(r.status, 200);
   assert.match(r.headers.get('content-type'), /^text\/event-stream/);
@@ -135,30 +140,34 @@ test('chat streams thought, text, usage and done; sends the right headers and co
   assert.deepEqual(evs.filter(e => e.step).map(e => e.step), ['thought', 'model_output']);
   assert.equal(evs.filter(e => e.th).map(e => e.th).join(''), 'Reading the retrieved passages. Passage 1 looks most relevant.');
   assert.match(evs.filter(e => e.t).map(e => e.t).join(''), /\[1\]/);
-  assert.equal(evs.find(e => e.usage).usage.total_thought_tokens, 17);
+  const u = evs.find(e => e.usage).usage;
+  assert.equal(u.total_thought_tokens, 17); assert.equal(u.total_output_tokens, 59);
   assert.deepEqual(evs.at(-1), { done: true });
 
   const [q] = await mockReqs();
-  assert.equal(q.path, '/v1beta/interactions'); assert.equal(q.query, '?alt=sse');
-  assert.equal(q.headers['x-goog-api-key'], KEY);
-  assert.equal(q.headers['api-revision'], '2026-05-20');
-  assert.deepEqual(q.body.generation_config, { thinking_level: 'high', thinking_summaries: 'auto' });
-  assert.equal(q.body.model, 'gemini-3.8-flash'); assert.equal(q.body.stream, true); assert.equal(q.body.store, false);
-  assert.match(q.body.system_instruction, /\[1\] \(policy\.txt\)\nUnused items/);
-  assert.deepEqual(q.body.input.map(i => i.type), ['user_input', 'model_output', 'user_input']);
+  assert.equal(q.path, '/openai/v1/chat/completions');
+  assert.equal(q.headers.authorization, `Bearer ${GROQ_KEY}`);
+  assert.equal(q.headers['x-goog-api-key'], undefined);
+  assert.equal(q.body.model, 'openai/gpt-oss-120b'); assert.equal(q.body.stream, true);
+  assert.equal(q.body.reasoning_effort, 'high'); assert.equal(q.body.include_reasoning, true);
+  assert.match(q.body.messages[0].content, /\[1\] \(policy\.txt\)\nUnused items/);
+  assert.deepEqual(q.body.messages.map(m => m.role), ['system', 'user', 'assistant', 'user']);
 });
-test('chat: invalid thinking level falls back to the server default; empty revision omits header', async () => {
-  process.env.GEMINI_THINKING_LEVEL = 'medium'; process.env.GEMINI_API_REVISION = '';
-  await readSSE(await post('/api/chat', { question: 'Q', context: CTX, thinking: 'extreme' }));
-  const [q] = await mockReqs();
-  assert.equal(q.body.generation_config.thinking_level, 'medium');
-  assert.equal(q.headers['api-revision'], undefined);
+test('chat: invalid or removed thinking levels fall back to the server default', async () => {
+  process.env.GROQ_REASONING_EFFORT = 'medium';
+  for (const thinking of ['extreme', 'minimal']) await readSSE(await post('/api/chat', { question: 'Q', context: CTX, thinking }));
+  assert.deepEqual((await mockReqs()).map(q => q.body.reasoning_effort), ['medium', 'medium']);
+});
+test('chat honours GROQ_MODEL', async () => {
+  process.env.GROQ_MODEL = 'openai/gpt-oss-20b';
+  await readSSE(await post('/api/chat', { question: 'Q', context: CTX }));
+  assert.equal((await mockReqs())[0].body.model, 'openai/gpt-oss-20b');
 });
 test('chat keeps only the last 8 history items', async () => {
   const history = Array.from({ length: 12 }, (_, i) => ({ role: i % 2 ? 'assistant' : 'user', content: 'm' + i }));
   await readSSE(await post('/api/chat', { question: 'Q', context: CTX, history }));
   const [q] = await mockReqs();
-  assert.equal(q.body.input.length, 9); assert.equal(q.body.input[0].content[0].text, 'm4');
+  assert.equal(q.body.messages.length, 10); assert.equal(q.body.messages[1].content, 'm4');
 });
 test('chat validation errors are 400', async () => {
   for (const body of [{}, { question: '  ' }, { question: 'x'.repeat(4001) }, { question: 'q', context: Array(13).fill(CTX[0]) }, { question: 'q', context: [{ n: 1, text: 'x'.repeat(20_001) }] }, { question: 'q', context: 'nope' }]) {
@@ -170,14 +179,20 @@ test('chat validation errors are 400', async () => {
 test('chat upstream errors before the stream are JSON and not retried', async () => {
   await failNext(503, 'down', 1);
   const r = await post('/api/chat', { question: 'q', context: CTX });
-  assert.equal(r.status, 502); assert.equal((await r.json()).error, 'Gemini is unavailable, try again');
+  assert.equal(r.status, 502); assert.equal((await r.json()).error, 'Groq is unavailable, try again');
   assert.equal((await mockReqs()).length, 1);
+  await failNext(401, 'Invalid API Key', 1);
+  const r401 = await post('/api/chat', { question: 'q', context: CTX });
+  assert.equal(r401.status, 502); assert.match((await r401.json()).error, /check that GROQ_API_KEY is a valid Groq API key/);
   await failNext(429, 'slow down', 1);
   assert.equal((await post('/api/chat', { question: 'q', context: CTX })).status, 429);
 });
-test('chat without a key is 500', async () => {
+test('chat needs only the Groq key', async () => {
   process.env.GEMINI_API_KEY = '';
-  assert.equal((await post('/api/chat', { question: 'q' })).status, 500);
+  assert.equal((await post('/api/chat', { question: 'q', context: CTX })).status, 200);
+  process.env.GROQ_API_KEY = '';
+  const r = await post('/api/chat', { question: 'q' });
+  assert.equal(r.status, 500); assert.equal((await r.json()).error, 'GROQ_API_KEY is not set on the server');
 });
 
 /* ---------- misc ---------- */
@@ -206,12 +221,17 @@ test('Lumen 429s carry Retry-After', async () => {
   const s = Number(r.headers.get('retry-after'));
   assert.ok(s >= 1 && s <= 60, `Retry-After ${s}`);
 });
-test('upstream 429 Retry-After is passed through', async () => {
+test('upstream 429 Retry-After is passed through (Groq header, Gemini RetryInfo)', async () => {
   const realFetch = globalThis.fetch;
-  globalThis.fetch = async (url, opts) => String(url).startsWith(base) ? realFetch(url, opts)
-    : new Response(JSON.stringify({ error: { code: 429, message: 'Quota', details: [{ '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '17s' }] } }), { status: 429 });
+  globalThis.fetch = async (url, opts) => {
+    if (String(url).startsWith(base)) return realFetch(url, opts);
+    if (String(url).includes('/openai/')) return new Response(JSON.stringify({ error: { message: 'Rate limit reached' } }), { status: 429, headers: { 'retry-after': '9' } });
+    return new Response(JSON.stringify({ error: { code: 429, message: 'Quota', details: [{ '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '17s' }] } }), { status: 429 });
+  };
   try {
     const r = await post('/api/chat', { question: 'q', context: CTX });
-    assert.equal(r.status, 429); assert.equal(r.headers.get('retry-after'), '17');
+    assert.equal(r.status, 429); assert.equal(r.headers.get('retry-after'), '9');
+    const e = await post('/api/embed', { texts: ['a'] });
+    assert.equal(e.status, 429); assert.equal(e.headers.get('retry-after'), '17');
   } finally { globalThis.fetch = realFetch; }
 });

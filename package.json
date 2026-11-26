@@ -10,7 +10,7 @@
   "scripts": {
     "dev": "node scripts/dev-server.js",
     "start": "node scripts/dev-server.js",
-    "dev:mock": "node test/mock-gemini.js & GEMINI_BASE_URL=http://localhost:4999 GEMINI_API_KEY=test GOOGLE_API_KEY= node scripts/dev-server.js",
+    "dev:mock": "node test/mock-gemini.js & GEMINI_BASE_URL=http://localhost:4999 GEMINI_API_KEY=test GOOGLE_API_KEY= GROQ_BASE_URL=http://localhost:4999/openai/v1 GROQ_API_KEY=test node scripts/dev-server.js",
     "test": "node --test \"test/*.test.js\""
   }
 }

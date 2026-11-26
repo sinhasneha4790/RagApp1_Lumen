@@ -1,4 +1,4 @@
-// Local mock of the Gemini endpoints Lumen uses (spec 12.2). No real key needed.
+// Local mock of the upstream APIs Lumen uses: Gemini embeddings and Groq chat. No real keys needed.
 //   node test/mock-gemini.js          → listens on :4999 (MOCK_PORT to change)
 // Test hooks (mock only):
 //   GET  /__requests                  → requests received so far (headers + body)
@@ -43,14 +43,15 @@ export function startMock({ port = 4999, delay = 15, quiet = false } = {}) {
     requests.push({ method: req.method, path: url.pathname, query: url.search, headers: req.headers, body });
     // Log what was received, with the key redacted.
     log(req.method, url.pathname + url.search, {
-      'x-goog-api-key': req.headers['x-goog-api-key'] ? '(present)' : '(missing)',
-      'api-revision': req.headers['api-revision'] ?? '(none)',
-      thinking_level: body?.generation_config?.thinking_level,
-      thinking_summaries: body?.generation_config?.thinking_summaries,
+      key: req.headers['x-goog-api-key'] || req.headers.authorization ? '(present)' : '(missing)',
+      model: body?.model,
+      reasoning_effort: body?.reasoning_effort,
       taskType: body?.requests?.[0]?.taskType
     });
 
-    if (!req.headers['x-goog-api-key']) return json(403, { error: { code: 403, message: 'Method doesn\'t allow unregistered callers.' } });
+    const isGroq = url.pathname.startsWith('/openai/');
+    if (isGroq ? !/^Bearer \S+/.test(req.headers.authorization || '') : !req.headers['x-goog-api-key'])
+      return json(401, { error: { message: 'Invalid API Key', type: 'invalid_request_error' } });
     if (failures.length) { const f = failures.shift(); return json(f.status, { error: { code: f.status, message: f.message } }); }
 
     const m = url.pathname.match(/^\/v1beta\/models\/([^/:]+):batchEmbedContents$/);
@@ -59,23 +60,22 @@ export function startMock({ port = 4999, delay = 15, quiet = false } = {}) {
       return json(200, { embeddings: reqs.map(r => ({ values: mockVector(r.content?.parts?.map(p => p.text).join(' '), r.outputDimensionality || 3072) })) });
     }
 
-    if (req.method === 'POST' && /^\/v1(beta)?\/interactions$/.test(url.pathname)) {
+    if (req.method === 'POST' && url.pathname === '/openai/v1/chat/completions') {
+      // Groq / OpenAI-compatible streamed chat completion.
       res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
-      const send = async ev => { res.write(`event: ${ev.event_type}\ndata: ${JSON.stringify(ev)}\n\n`); await sleep(delay); };
-      const sys = String(body?.system_instruction || '');
+      const id = 'chatcmpl-mock';
+      const chunk = async (delta, extra = {}) => { res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', model: body?.model, choices: [{ index: 0, delta, finish_reason: null }], ...extra })}\n\n`); await sleep(delay); };
+      const sys = String(body?.messages?.[0]?.content || '');
       const has = /\n\[1\] \(/.test(sys);
-      await send({ event_type: 'interaction.created', interaction: { id: 'mock-1', status: 'in_progress' } });
-      await send({ event_type: 'step.start', index: 0, step: { type: 'thought' } });
-      await send({ event_type: 'step.delta', index: 0, delta: { type: 'thought_summary', content: { type: 'text', text: 'Reading the retrieved passages. ' } } });
-      await send({ event_type: 'step.delta', index: 0, delta: { type: 'thought_summary', content: { type: 'text', text: 'Passage 1 looks most relevant.' } } });
-      await send({ event_type: 'step.stop', index: 0 });
-      await send({ event_type: 'step.start', index: 1, step: { type: 'model_output' } });
+      await chunk({ role: 'assistant', content: '' });
+      await chunk({ reasoning: 'Reading the retrieved passages. ' });
+      await chunk({ reasoning: 'Passage 1 looks most relevant.' });
       const pieces = has
-        ? ['This is a **mock** answer ', 'from the local Gemini stub. ', 'It is based on passage ', '[1].', '\n- Thinking level: ' + (body?.generation_config?.thinking_level || 'none')]
+        ? ['This is a **mock** answer ', 'from the local Groq stub. ', 'It is based on passage ', '[1].', '\n- Reasoning effort: ' + (body?.reasoning_effort || 'none')]
         : ['The uploaded documents don\'t cover this ', '(mock answer, no passages were sent).'];
-      for (const text of pieces) await send({ event_type: 'step.delta', index: 1, delta: { type: 'text', text } });
-      await send({ event_type: 'step.stop', index: 1 });
-      await send({ event_type: 'interaction.completed', interaction: { id: 'mock-1', status: 'completed', usage: { total_input_tokens: Math.ceil(sys.length / 4), total_output_tokens: 42, total_thought_tokens: 17, total_tokens: Math.ceil(sys.length / 4) + 59 } } });
+      for (const content of pieces) await chunk({ content });
+      const prompt = Math.ceil(sys.length / 4);
+      res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', model: body?.model, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], x_groq: { id: 'req_mock', usage: { prompt_tokens: prompt, completion_tokens: 59, total_tokens: prompt + 59, completion_tokens_details: { reasoning_tokens: 17 } } } })}\n\n`);
       res.write('data: [DONE]\n\n');
       return res.end();
     }

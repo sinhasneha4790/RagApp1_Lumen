@@ -112,16 +112,16 @@ main{display:flex;flex-direction:column;height:100vh;overflow:hidden;background:
 .bubble code{background:var(--bg);padding:1px 6px;border-radius:5px;font-size:14px}
 .cite{display:inline-flex;align-items:center;justify-content:center;min-width:20px;height:20px;padding:0 5px;margin:0 1px;border-radius:6px;border:0;background:var(--glow);color:var(--rose);font-size:12px;font-weight:600;vertical-align:2px}
 .cite:hover{background:var(--rose);color:#2a0f1c}
-/* Gemini mark, panel and answer trace */
+/* Star mark, models panel and answer trace */
 .gem{display:inline-block;width:18px;height:18px;background:#2a0f1c;clip-path:polygon(50% 0,60% 40%,100% 50%,60% 60%,50% 100%,40% 60%,0 50%,40% 40%);vertical-align:-3px}
 .gem.sm{width:14px;height:14px;background:var(--rose);vertical-align:-1px;margin-right:6px}
 .gpanel{background:linear-gradient(160deg,#2f1a33,var(--card) 55%);border:1px solid var(--line);border-radius:16px;padding:14px}
 .gpanel .sec-h h2{display:flex;align-items:center}
 #gconn{display:inline-flex;align-items:center;gap:6px}
 .models{display:grid;grid-template-columns:auto minmax(0,1fr);gap:6px 12px;margin:4px 0 14px;font-size:13px}
-.models dt{color:var(--mute)}.models dd{margin:0;text-align:right;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.models dt{color:var(--mute)}.models .nw{white-space:nowrap}.models dd{margin:0;text-align:right;font-variant-numeric:tabular-nums;overflow-wrap:break-word}
 .lbl{font-size:14px;margin-bottom:6px}
-.seg{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));background:var(--rail);border:1px solid var(--line);border-radius:12px;padding:3px;gap:3px}
+.seg{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));background:var(--rail);border:1px solid var(--line);border-radius:12px;padding:3px;gap:3px}
 .seg button{min-height:38px;border:0;border-radius:9px;background:none;font-size:13px;color:var(--mute)}
 .seg button[aria-checked=true]{background:var(--rose);color:#2a0f1c;font-weight:600}
 .trace{background:var(--rail);border:1px solid var(--line);border-radius:14px;margin-bottom:10px;font-size:14px}
@@ -224,7 +224,7 @@ dialog .list{padding:6px 20px 20px;max-height:70vh;overflow-y:auto}
   </section>
 
   <section class="gpanel">
-    <div class="sec-h"><h2><span class="gem sm"></span> Gemini</h2><span id="gconn">Connecting…</span></div>
+    <div class="sec-h"><h2><span class="gem sm"></span> Models</h2><span id="gconn">Connecting…</span></div>
     <dl class="models" id="models"></dl>
     <div class="lbl" id="segL">Thinking level</div>
     <div class="seg" role="radiogroup" aria-labelledby="segL" id="seg"></div>
@@ -237,7 +237,7 @@ dialog .list{padding:6px 20px 20px;max-height:70vh;overflow-y:auto}
     <div class="row"><label for="cover">Overlap <output id="coverO"></output></label><input type="range" id="cover" min="0" max="600" step="50" value="150"></div>
     <div class="row"><label for="topk">Chunks sent to the LLM <output id="topkO"></output></label><input type="range" id="topk" min="1" max="12" step="1" value="5"></div>
     <button class="btn" id="rechunk" type="button" style="width:100%">Re-chunk all files</button>
-    <p class="note">Chunks are embedded with Gemini and ranked by cosine similarity, blended with a keyword score. Only the top matches are sent to Gemini to write the answer.</p>
+    <p class="note">Chunks are embedded with Gemini and ranked by cosine similarity, blended with a keyword score. Only the top matches are sent to Groq to write the answer.</p>
   </details>
 </aside>
 
@@ -365,12 +365,13 @@ const settings=()=>({size:+$('csize').value||900,overlap:+$('cover').value||0,k:
 let uid=0;
 const STAGES=['Reading','Chunking','Embedding with Gemini','Indexing','Ready'];
 let thinkLevel='low';try{thinkLevel=localStorage.getItem('lumen-think')||'low'}catch(e){}
-const LEVEL_NOTE={minimal:'Fastest. Little to no reasoning before answering.',low:'Quick answers with light reasoning. A good default for document Q&A.',medium:'More reasoning for questions that span several passages.',high:'Deepest reasoning. Slower, and uses more thought tokens.'};
+const LEVEL_NOTE={low:'Quick answers with light reasoning. A good default for document Q&A.',medium:'More reasoning for questions that span several passages.',high:'Deepest reasoning. Slower, and uses more reasoning tokens.'};
+if(!LEVEL_NOTE[thinkLevel])thinkLevel='low'; // e.g. a saved 'minimal' from the Gemini version
 function renderGemini(){
   const h=health;
   $('gconn').innerHTML=h?(h.ok?'<i class="dot"></i>Connected':'<i class="dot off"></i>Not connected'):'Connecting…';
   $('gconn').title=h&&!h.ok?(h.error||''):'';
-  $('models').innerHTML=h&&h.chatModel?[['Chat model',h.chatModel],['Embeddings',`${h.embedModel} · ${h.dim}-d`],['API',`Interactions · ${h.apiVersion||'v1beta'}`]].map(([a,b])=>`<dt>${a}</dt><dd>${esc(b)}</dd>`).join(''):`<dt>Server</dt><dd>${esc(h?.error||'checking…')}</dd>`;
+  $('models').innerHTML=h&&h.chatModel?[['Chat','Groq',h.chatModel,''],['Embeddings','Gemini',h.embedModel,` · ${h.dim}-d`],['API','Groq','Chat Completions','']].map(([a,p,m,x])=>`<dt>${a}</dt><dd>${p} · <span class="nw">${esc(m)}</span>${esc(x)}</dd>`).join(''):`<dt>Server</dt><dd>${esc(h?.error||'checking…')}</dd>`;
   $('seg').innerHTML=Object.keys(LEVEL_NOTE).map(l=>`<button type="button" role="radio" aria-checked="${l===thinkLevel}" data-level="${l}">${l[0].toUpperCase()+l.slice(1)}</button>`).join('');
   $('segNote').textContent=LEVEL_NOTE[thinkLevel];
 }
@@ -427,7 +428,7 @@ function renderFiles(){
   const total=docs.reduce((n,d)=>n+(d.status==='ready'?d.chunks.length:d.status==='error'?0:d.nChunks||0),0);
   $('libwarn').hidden=total<=CHUNK_WARN;
   $('libwarn').textContent=`${total.toLocaleString()} chunks in your library. Above ${CHUNK_WARN.toLocaleString()}, the page may slow down or run out of memory. Remove some files or raise the chunk size.`;
-  const g=health?(health.ok?`<span class="pill" title="Embeddings: ${esc(health.embedModel)}"><i class="dot"></i>Gemini · <b>${esc(health.chatModel)}</b></span>`:`<span class="pill" title="${esc(health.error||'')}"><i class="dot off"></i>Gemini not connected</span>`):'';
+  const g=health?(health.ok?`<span class="pill" title="Embeddings: Gemini · ${esc(health.embedModel)}"><i class="dot"></i>Groq · <b>${esc(health.chatModel)}</b></span>`:`<span class="pill" title="${esc(health.error||'')}"><i class="dot off"></i>${health.chatReady===true?'Gemini embeddings not connected':'Groq not connected'}</span>`):'';
   $('stat').innerHTML=`${g}<span class="pill"><b>${ready}</b> file${ready===1?'':'s'} indexed</span><span class="pill k"><b>${chunks.length}</b> chunks</span><span class="pill k">top <b>${settings().k}</b> per question</span>`;
   if(!history.length)renderWelcome();
 }
@@ -459,9 +460,9 @@ function renderWelcome(){
   const qs=docs.some(d=>d.sample&&d.status==='ready')?['How long do I have to return an item?','What does the warranty not cover?','Who pays for international returns?']:['Summarise this document','What are the key dates or deadlines?','List the main points'];
   $('thread').innerHTML=`<div class="hero">
   <h1>${has?'Ask your documents <em>anything</em>.':'Upload a file and <em>start asking</em>.'}</h1>
-  <p>${has?'Gemini answers only from the passages it finds in your files, with numbered sources you can open and check.':'Drop a PDF, Word file or text on the left. It’s split into chunks, embedded, and searched each time you ask.'}</p>
+  <p>${has?'Groq answers only from the passages it finds in your files, with numbered sources you can open and check.':'Drop a PDF, Word file or text on the left. It’s split into chunks, embedded, and searched each time you ask.'}</p>
   ${SCENE}
-  <div class="steps"><div><b>Read &amp; chunk</b>in your browser</div><div><b>Embed</b>${esc(health?.embedModel||'gemini-embedding-001')}</div><div><b>Search</b>cosine similarity</div><div><b>Think &amp; answer</b>${esc(health?.chatModel||'Gemini')}</div></div>
+  <div class="steps"><div><b>Read &amp; chunk</b>in your browser</div><div><b>Embed</b>${esc(health?.embedModel||'gemini-embedding-001')}</div><div><b>Search</b>cosine similarity</div><div><b>Think &amp; answer</b>${esc(health?.chatModel||'Groq')}</div></div>
   ${has?`<div class="chips">${qs.map(q=>`<button class="chip" type="button" data-q="${esc(q)}">${esc(q)}</button>`).join('')}</div>`:''}</div>`;
 }
 function md(s,n){
@@ -486,17 +487,17 @@ function srcHTML(hits){
 const scrollEnd=()=>{const c=$('chat');c.scrollTop=c.scrollHeight};
 
 /* ---------- Ask ---------- */
-/* Trace: the four steps Gemini actually runs for every question */
+/* Trace: the four steps that run for every question (Gemini embeds, Groq answers) */
 const fmtMs=ms=>ms==null?'':ms<1000?Math.round(ms)+' ms':(ms/1000).toFixed(1)+' s';
-const LV={minimal:'Minimal',low:'Low',medium:'Medium',high:'High'};
+const LV={low:'Low',medium:'Medium',high:'High'};
 function traceHTML(T){
-  const hm=health||{};const em=hm.embedModel||'gemini-embedding-001',cm=hm.chatModel||'Gemini';
+  const hm=health||{};const em=hm.embedModel||'gemini-embedding-001',cm=hm.chatModel||'Groq';
   const embTask=em.startsWith('gemini-embedding-2')?'search-query prefix':'RETRIEVAL_QUERY';
   const rows=[
     ['emb','Embed your question',T.emb.err?`Embedding failed, so keyword search was used. ${T.emb.err}`:`${em} · ${embTask} · ${hm.dim||768}-dimensional vector`],
     ['ret','Find matching passages',T.ret.n!=null?`${T.ret.n} of ${chunks.length} chunks · ${T.ret.sem?'80% cosine similarity + 20% keyword':'keyword match'}${T.ret.best!=null?` · best ${T.ret.best.toFixed(2)}`:''}`:`Comparing against ${chunks.length} chunk vectors`],
-    ['thk','Think',`Thinking level: ${LV[T.level]||T.level}${T.usage&&T.usage.total_thought_tokens!=null?` · ${T.usage.total_thought_tokens} thought tokens`:''}${T.thk.state==='done'&&!T.thought?' · no summary returned':''}`],
-    ['ans','Write the answer',`${cm} · Interactions API, streamed${T.usage&&T.usage.total_output_tokens!=null?` · ${T.usage.total_output_tokens} output tokens`:''}`]
+    ['thk','Think',`Thinking level: ${LV[T.level]||T.level}${T.usage&&T.usage.total_thought_tokens!=null?` · ${T.usage.total_thought_tokens} reasoning tokens`:''}${T.thk.state==='done'&&!T.thought?' · no reasoning returned':''}`],
+    ['ans','Write the answer',`Groq · ${cm} · Chat Completions, streamed${T.usage&&T.usage.total_output_tokens!=null?` · ${T.usage.total_output_tokens} output tokens`:''}`]
   ];
   const sum=T.failed?`<span class="fail">Failed at ${esc(rows.find(([k])=>k===T.failedAt)?.[1]||'the last step')}${T.total!=null?` after ${fmtMs(T.total)}`:''}</span>`
     :T.done?`Embedded → ${T.ret.n} passage${T.ret.n===1?'':'s'} → thought ${fmtMs(T.thk.ms)} → answered in ${fmtMs(T.total)}${T.usage&&T.usage.total_tokens?` · ${T.usage.total_tokens.toLocaleString()} tokens`:''}`
@@ -541,7 +542,7 @@ async function ask(q){
           answer+=ev.t;body.innerHTML=md(answer,hits.length);scrollEnd()}
       }
     }
-    if(!answer.trim())throw new Error('Gemini returned an empty answer.');
+    if(!answer.trim())throw new Error('Groq returned an empty answer.');
     T.ans={state:'done',ms:performance.now()-(tFirst||tc)};T.total=performance.now()-t0;T.done=true;
     tr.open=false;paint();
     history.push({role:'user',content:q},{role:'assistant',content:answer});

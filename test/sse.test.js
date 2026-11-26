@@ -1,81 +1,119 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createSSEParser, mapEvent, normalize, pipeInteraction, textFromInteraction, embedRequests, buildInteractionBody } from '../lib/gemini.js';
+import { createSSEParser } from '../lib/sse.js';
+import { buildChatBody, createChunkMapper, mapUsage, pipeChat, groqError } from '../lib/groq.js';
+import { normalize, embedRequests, geminiError } from '../lib/gemini.js';
+import { redact } from '../lib/http.js';
 import { getConfig } from '../lib/config.js';
 
-const EVENTS = [
-  { event_type: 'interaction.created', interaction: { id: 'x' } },
-  { event_type: 'step.start', index: 0, step: { type: 'thought' } },
-  { event_type: 'step.delta', delta: { type: 'thought_summary', content: { type: 'text', text: 'Looking at ' } } },
-  { event_type: 'step.delta', delta: { type: 'thought_summary', text: 'passage 1.' } },
-  { event_type: 'step.delta', delta: { type: 'thought_signature', signature: 'abc' } },
-  { event_type: 'step.stop', index: 0 },
-  { event_type: 'step.start', index: 1, step: { type: 'model_output' } },
-  { event_type: 'step.delta', delta: { type: 'text', text: 'You have 30 days ' } },
-  { event_type: 'step.delta', delta: { type: 'text', text: '[1].' } },
-  { event_type: 'interaction.status_update', status: 'in_progress' },
-  { event_type: 'interaction.completed', interaction: { status: 'completed', usage: { total_input_tokens: 10, total_output_tokens: 5, total_thought_tokens: 3, total_tokens: 18 } } }
+// Groq (OpenAI-compatible) streamed chunks, as documented: choices[0].delta.{reasoning,content},
+// terminated by data: [DONE]; usage on the final chunk.
+const CHUNKS = [
+  { id: 'c', object: 'chat.completion.chunk', choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] },
+  { id: 'c', choices: [{ index: 0, delta: { reasoning: 'Looking at ' } }] },
+  { id: 'c', choices: [{ index: 0, delta: { reasoning: 'passage 1.' } }] },
+  { id: 'c', choices: [{ index: 0, delta: { content: 'You have 30 days ' } }] },
+  { id: 'c', choices: [{ index: 0, delta: { content: '[1].' } }] },
+  { id: 'c', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], x_groq: { id: 'req_1', usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, completion_tokens_details: { reasoning_tokens: 3 } } } }
 ];
-const EXPECTED = [
-  { step: 'thought' }, { th: 'Looking at ' }, { th: 'passage 1.' },
-  { step: 'model_output' }, { t: 'You have 30 days ' }, { t: '[1].' },
-  { usage: { total_input_tokens: 10, total_output_tokens: 5, total_thought_tokens: 3, total_tokens: 18 } }
-];
-const wire = (sep = '\n') => EVENTS.map(e => `event: message${sep}data: ${JSON.stringify(e)}${sep}${sep}`).join('') + `data: [DONE]${sep}${sep}`;
+const USAGE = { total_input_tokens: 10, total_output_tokens: 5, total_tokens: 15, total_thought_tokens: 3 };
+const EXPECTED = [{ step: 'thought' }, { th: 'Looking at ' }, { th: 'passage 1.' }, { step: 'model_output' }, { t: 'You have 30 days ' }, { t: '[1].' }];
+const wire = (sep = '\n') => CHUNKS.map(e => `data: ${JSON.stringify(e)}${sep}${sep}`).join('') + `data: [DONE]${sep}${sep}`;
 
 function parseAll(pieces) {
-  const out = []; const p = createSSEParser(e => out.push(e));
-  for (const s of pieces) p.push(s); p.end(); return out;
+  const out = []; const m = createChunkMapper();
+  const p = createSSEParser(ev => out.push(...m.map(ev)));
+  for (const s of pieces) p.push(s); p.end();
+  return { events: out, usage: m.usage() };
 }
 
-test('parses the section 7.3 example stream', () => {
-  assert.deepEqual(parseAll([wire()]), EXPECTED);
+test('parses a Groq chat stream into th/t events and usage', () => {
+  const r = parseAll([wire()]);
+  assert.deepEqual(r.events, EXPECTED);
+  assert.deepEqual(r.usage, USAGE);
 });
 
-test('handles events split across network chunks at every offset', () => {
+test('handles chunks split across network reads at every offset', () => {
   const s = wire();
   for (const size of [1, 3, 7, 64]) {
     const pieces = []; for (let i = 0; i < s.length; i += size) pieces.push(s.slice(i, i + size));
-    assert.deepEqual(parseAll(pieces), EXPECTED, `chunk size ${size}`);
+    assert.deepEqual(parseAll(pieces).events, EXPECTED, `chunk size ${size}`);
   }
 });
 
 test('handles \\r\\n line endings, including split between \\r and \\n', () => {
   const s = wire('\r\n');
-  assert.deepEqual(parseAll([s]), EXPECTED);
+  assert.deepEqual(parseAll([s]).events, EXPECTED);
   const pieces = []; for (let i = 0; i < s.length; i += 2) pieces.push(s.slice(i, i + 2));
-  assert.deepEqual(parseAll(pieces), EXPECTED);
+  assert.deepEqual(parseAll(pieces).events, EXPECTED);
 });
 
 test('ignores [DONE], comments and malformed JSON', () => {
-  assert.deepEqual(parseAll([': keep-alive\n\ndata: {oops\n\ndata: [DONE]\n\n']), []);
+  assert.deepEqual(parseAll([': keep-alive\n\ndata: {oops\n\ndata: [DONE]\n\n']).events, []);
 });
 
-test('maps error events and non-completed status', () => {
-  assert.deepEqual(mapEvent({ event_type: 'error', error: { code: 'X', message: 'boom' } }), [{ error: 'boom' }]);
-  assert.deepEqual(mapEvent({ event_type: 'interaction.completed', interaction: { status: 'failed' } }), [{ error: 'Generation ended with status "failed"' }]);
+test('usage is read from `usage` or `x_groq.usage`', () => {
+  const m = createChunkMapper();
+  m.map({ choices: [], usage: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 } });
+  assert.deepEqual(m.usage(), { total_input_tokens: 1, total_output_tokens: 2, total_tokens: 3 });
+  assert.equal(mapUsage(null), null);
 });
 
-test('pipeInteraction emits done after a clean stream and stops after an error', async () => {
+test('mid-stream error chunks become {error}', () => {
+  assert.deepEqual(createChunkMapper().map({ error: { message: 'boom', type: 'server_error' } }), [{ error: 'boom' }]);
+});
+
+test('pipeChat emits usage then done, and stops after an error', async () => {
   const mk = text => new Response(text, { headers: { 'content-type': 'text/event-stream' } });
-  const a = []; await pipeInteraction(mk(wire()), e => a.push(e));
-  assert.deepEqual(a, [...EXPECTED, { done: true }]);
+  const a = []; await pipeChat(mk(wire()), e => a.push(e));
+  assert.deepEqual(a, [...EXPECTED, { usage: USAGE }, { done: true }]);
   const b = [];
-  const failed = await pipeInteraction(mk('data: {"event_type":"step.delta","delta":{"type":"text","text":"Hi"}}\n\ndata: {"event_type":"error","error":{"message":"bad"}}\n\ndata: {"event_type":"step.delta","delta":{"type":"text","text":"later"}}\n\n'), e => b.push(e));
+  const failed = await pipeChat(mk('data: {"choices":[{"delta":{"content":"Hi"}}]}\n\ndata: {"error":{"message":"bad"}}\n\ndata: {"choices":[{"delta":{"content":"later"}}]}\n\n'), e => b.push(e));
   assert.equal(failed, true);
-  assert.deepEqual(b, [{ t: 'Hi' }, { error: 'bad' }]);
+  assert.deepEqual(b, [{ step: 'model_output' }, { t: 'Hi' }, { error: 'bad' }]);
 });
 
-test('non-streamed JSON fallback joins model_output text', async () => {
-  const j = { status: 'completed', steps: [{ type: 'thought', content: [{ type: 'text', text: 'no' }] }, { type: 'model_output', content: [{ type: 'text', text: 'A ' }, { type: 'text', text: 'B' }] }] };
-  assert.equal(textFromInteraction(j), 'A B');
-  const out = []; await pipeInteraction(new Response(JSON.stringify(j), { headers: { 'content-type': 'application/json' } }), e => out.push(e));
-  assert.deepEqual(out, [{ t: 'A B' }, { done: true }]);
+test('non-streamed JSON fallback', async () => {
+  const j = { choices: [{ message: { role: 'assistant', content: 'A B', reasoning: 'think' } }], usage: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 } };
+  const out = []; await pipeChat(new Response(JSON.stringify(j), { headers: { 'content-type': 'application/json' } }), e => out.push(e));
+  assert.deepEqual(out, [{ th: 'think' }, { t: 'A B' }, { usage: { total_input_tokens: 1, total_output_tokens: 2, total_tokens: 3 } }, { done: true }]);
+});
+
+test('chat body: system prompt, history, reasoning effort', () => {
+  const b = buildChatBody({ question: 'Q', context: [], history: [{ role: 'user', content: 'a' }, { role: 'assistant', content: 'b' }], thinking: 'high' }, getConfig({}));
+  assert.equal(b.model, 'openai/gpt-oss-120b');
+  assert.equal(b.stream, true);
+  assert.equal(b.reasoning_effort, 'high');
+  assert.equal(b.include_reasoning, true);
+  assert.equal(b.max_completion_tokens, 4096);
+  assert.deepEqual(b.messages.map(m => m.role), ['system', 'user', 'assistant', 'user']);
+  assert.match(b.messages[0].content, /\(no matching passages were found\)$/);
+  assert.equal(b.messages[3].content, 'Q');
+});
+
+test('groqError maps statuses, logs Groq text with keys redacted', async () => {
+  const logs = []; const orig = console.warn; console.warn = m => logs.push(m);
+  process.env.GROQ_API_KEY = 'gsk_secretsecretsecretsecret12';
+  try {
+    const e503 = await groqError(new Response(JSON.stringify({ error: { message: 'over capacity', type: 'server_error' } }), { status: 503 }));
+    assert.equal(e503.status, 502); assert.equal(e503.message, 'Groq is unavailable, try again');
+    const e401 = await groqError(new Response(JSON.stringify({ error: { message: 'Invalid API Key gsk_secretsecretsecretsecret12', type: 'invalid_request_error' } }), { status: 401 }));
+    assert.equal(e401.status, 502); assert.match(e401.message, /check that GROQ_API_KEY is a valid Groq API key/);
+    const e429 = await groqError(new Response(JSON.stringify({ error: { message: 'Rate limit' } }), { status: 429, headers: { 'retry-after': '7' } }));
+    assert.equal(e429.status, 429); assert.equal(e429.retryAfter, 7);
+    const e400 = await groqError(new Response(JSON.stringify({ error: { message: 'bad model' } }), { status: 400 }));
+    assert.equal(e400.status, 502); assert.equal(e400.message, 'bad model');
+    assert.match(logs[0], /^groq upstream 503: server_error: over capacity/);
+    assert.ok(logs.every(l => !l.includes('gsk_secret')));
+  } finally { console.warn = orig; delete process.env.GROQ_API_KEY; }
+});
+
+test('redact removes Gemini and Groq style keys', () => {
+  assert.equal(redact('a AIzaSyA1234567890abcdefghijklmn b gsk_abcdefghijklmnopqrstuvwx c', []), 'a [redacted] b [redacted] c');
 });
 
 test('normalize returns unit vectors and leaves zero vectors finite', () => {
-  const v = normalize([3, 4]);
-  assert.deepEqual(v, [0.6, 0.8]);
+  assert.deepEqual(normalize([3, 4]), [0.6, 0.8]);
   assert.deepEqual(normalize([0, 0]), [0, 0]);
   const big = normalize(Array.from({ length: 768 }, (_, i) => i - 300));
   assert.ok(Math.abs(Math.hypot(...big) - 1) < 1e-9);
@@ -92,17 +130,7 @@ test('embed requests use taskType for gemini-embedding-001 and prefixes for gemi
   assert.equal(d.content.parts[0].text, 'title: none | text: hi');
 });
 
-test('interaction body matches section 7.3', () => {
-  const b = buildInteractionBody({ question: 'Q', context: [], history: [{ role: 'user', content: 'a' }, { role: 'assistant', content: 'b' }], thinking: 'high' }, getConfig({}));
-  assert.equal(b.model, 'gemini-3.8-flash');
-  assert.equal(b.stream, true); assert.equal(b.store, false);
-  assert.deepEqual(b.generation_config, { thinking_level: 'high', thinking_summaries: 'auto' });
-  assert.deepEqual(b.input.map(i => i.type), ['user_input', 'model_output', 'user_input']);
-  assert.match(b.system_instruction, /\(no matching passages were found\)$/);
-});
-
 test('geminiError logs Gemini\'s message, truncated and with keys redacted', async () => {
-  const { geminiError } = await import('../lib/gemini.js');
   const logs = []; const orig = console.warn; console.warn = m => logs.push(m);
   process.env.GEMINI_API_KEY = 'secret-key-12345';
   try {
@@ -111,7 +139,6 @@ test('geminiError logs Gemini\'s message, truncated and with keys redacted', asy
     assert.equal(e.status, 502); assert.equal(e.message, 'Gemini is unavailable, try again');
     assert.equal(logs.length, 1);
     assert.match(logs[0], /^gemini upstream 503: UNAVAILABLE: Model busy for key \[redacted\] and \[redacted\]/);
-    assert.ok(!logs[0].includes('secret-key-12345') && !logs[0].includes('AIza'));
     assert.ok(logs[0].length <= 'gemini upstream 503: '.length + 300);
   } finally { console.warn = orig; delete process.env.GEMINI_API_KEY; }
 });
